@@ -409,7 +409,7 @@ The sandbox never holds real credentials. Instead:
 
 1. Configure iron-proxy with the real secret source: environment variables, a
    file on disk, AWS Secrets Manager, AWS Systems Manager Parameter Store,
-   1Password (service account), or 1Password Connect.
+   1Password (service account), 1Password Connect, or a GitHub App.
 2. Give the sandbox a proxy token (e.g., `proxy-openai-abc123`).
 3. Configure the `secrets` transform to map proxy tokens to those sources.
 
@@ -459,6 +459,12 @@ Secret sources:
   `secret_ref` against a self-hosted 1Password Connect server. The server URL
   is read from `OP_CONNECT_HOST` and the API token from `OP_CONNECT_TOKEN`.
   Optional `ttl` and `failure_ttl` are supported.
+- **`github_app`:** signs a GitHub App JWT and exchanges it for an installation
+  access token. `app_id`, `installation_id`, and `private_key` are themselves
+  secret source blocks, so each value can come from any other supported source.
+  Optional `repositories` and `permissions` restrict the installation token.
+  Tokens are cached until five minutes before GitHub's expiration and refreshed
+  with single-flight behavior. `failure_ttl` defaults to 1m.
 
 Every source also accepts an optional `json_key`. When set, the resolved value
 is parsed as a JSON object and the single top-level string field at that key is
@@ -468,6 +474,47 @@ extracted. Use it to pull one field out of a JSON secret.
 (empty caches forever). `failure_ttl` controls how long a fetch error is
 cached before retrying; it defaults to 1m and is independent of `ttl`, so a
 long success TTL does not delay recovery from a transient backend outage.
+
+The GitHub App source works with both API clients and Git HTTPS. The secrets
+transform already decodes HTTP Basic authorization before replacement and
+re-encodes it afterwards, so the same proxy token can be supplied through
+`GH_TOKEN` or as the password for Git's `x-access-token` user:
+
+```yaml
+transforms:
+  - name: allowlist
+    config:
+      domains: ["api.github.com", "github.com"]
+
+  - name: secrets
+    config:
+      secrets:
+        - source:
+            type: github_app
+            app_id:
+              type: file
+              path: /run/secrets/github-app.json
+              json_key: app_id
+            installation_id:
+              type: file
+              path: /run/secrets/github-app.json
+              json_key: installation_id
+            private_key:
+              type: file
+              path: /run/secrets/github-app.json
+              json_key: private_key
+            repositories: ["sol"]
+            permissions:
+              contents: write
+              pull_requests: write
+          replace:
+            proxy_value: "proxy-github-app-token"
+            match_headers: ["Authorization"]
+            require: true
+          rules:
+            - host: "api.github.com"
+            - host: "github.com"
+```
 
   > **Note:** a bug in `onepassword-sdk-go` breaks builds with `CGO_ENABLED=0`,
   > so iron-proxy pins a [fork](https://github.com/ironsh/onepassword-sdk-go)

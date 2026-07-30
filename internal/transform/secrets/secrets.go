@@ -142,7 +142,7 @@ func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) 
 // used by both the secrets transform's factory and by BuildSource so other
 // transforms can compose the same sources.
 func defaultRegistry(logger *slog.Logger) sourceBuilderRegistry {
-	return sourceBuilderRegistry{
+	registry := sourceBuilderRegistry{
 		"env":               newEnvBuilder(logger),
 		"file":              newFileBuilder(logger),
 		"control_plane":     newControlPlaneBuilder(logger),
@@ -151,6 +151,10 @@ func defaultRegistry(logger *slog.Logger) sourceBuilderRegistry {
 		"1password":         newOPBuilder(logger),
 		"1password_connect": newOPConnectBuilder(logger),
 	}
+	registry["github_app"] = newGitHubAppBuilder(logger, func(node yaml.Node) (secretSource, error) {
+		return resolveSource(registry, node)
+	})
+	return registry
 }
 
 // BuildSource constructs a secret Source from a yaml node shaped like a
