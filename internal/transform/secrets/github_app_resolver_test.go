@@ -361,13 +361,55 @@ func TestGitHubAppSource_ServesOnlyMatchingUnexpiredTokenOnRefreshFailure(t *tes
 	require.Equal(t, int64(2), calls.Load())
 
 	appID.set("rotated-app-id")
-	now = now.Add(time.Minute)
+	now = now.Add(time.Second)
 	_, err = source.Get(context.Background())
 	require.Error(t, err)
 	require.Equal(t, int64(3), calls.Load())
 	_, err = source.Get(context.Background())
 	require.Error(t, err)
 	require.Equal(t, int64(3), calls.Load())
+}
+
+func TestGitHubAppSource_DoesNotServeTokenThatExpiresDuringRefresh(t *testing.T) {
+	_, privateKeyPEM := githubAppPrivateKey(t)
+	start := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	refreshStartedAt := start.Add(59*time.Minute + 50*time.Second)
+	refreshFailedAt := start.Add(60*time.Minute + 10*time.Second)
+	var nowUnix atomic.Int64
+	nowUnix.Store(start.Unix())
+	now := func() time.Time { return time.Unix(nowUnix.Load(), 0).UTC() }
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) > 1 {
+			nowUnix.Store(refreshFailedAt.Unix())
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		// The httptest response writer does not report encoding failures in this handler.
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "initial-token", "expires_at": start.Add(time.Hour)})
+	}))
+	t.Cleanup(server.Close)
+	source := buildGitHubAppTestSource(t, server, now, map[string]*githubAppTestSource{
+		"APP_ID":          {name: "app-id", value: "123"},
+		"INSTALLATION_ID": {name: "installation-id", value: "456"},
+		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
+	}, func(config map[string]any) {
+		config["failure_ttl"] = "5s"
+	})
+
+	token, err := source.Get(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "initial-token", token)
+	nowUnix.Store(refreshStartedAt.Unix())
+	token, err = source.Get(context.Background())
+	require.Error(t, err)
+	require.Empty(t, token)
+	require.Equal(t, int64(2), calls.Load())
+
+	_, err = source.Get(context.Background())
+	require.Error(t, err)
+	require.Equal(t, int64(2), calls.Load())
 }
 
 func TestGitHubAppBuilder_ValidatesConfiguration(t *testing.T) {

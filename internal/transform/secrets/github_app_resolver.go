@@ -148,9 +148,10 @@ type githubAppSource struct {
 	fingerprint [32]byte
 	token       string
 	expiresAt   time.Time
-	lastErr     error
-	retryAt     time.Time
-	serveStale  bool
+
+	failedFingerprint [32]byte
+	lastErr           error
+	retryAt           time.Time
 }
 
 func (s *githubAppSource) Name() string { return s.name }
@@ -159,14 +160,6 @@ func (s *githubAppSource) Get(ctx context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := s.now()
-	if s.lastErr != nil && now.Before(s.retryAt) {
-		if s.serveStale && s.token != "" && now.Before(s.expiresAt) {
-			return s.token, nil
-		}
-		return "", s.lastErr
-	}
-
 	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
 	defer cancel()
 
@@ -174,16 +167,24 @@ func (s *githubAppSource) Get(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	now := s.now()
+	if s.lastErr != nil && fingerprint == s.failedFingerprint && now.Before(s.retryAt) {
+		if fingerprint == s.fingerprint && s.token != "" && now.Before(s.expiresAt) {
+			return s.token, nil
+		}
+		return "", s.lastErr
+	}
 	if fingerprint == s.fingerprint && s.token != "" && now.Add(githubAppRefreshBefore).Before(s.expiresAt) {
 		return s.token, nil
 	}
 
 	token, expiresAt, err := s.mint(fetchCtx, credentials, now)
 	if err != nil {
+		now = s.now()
+		s.failedFingerprint = fingerprint
 		s.lastErr = err
 		s.retryAt = now.Add(s.failureTTL)
-		s.serveStale = fingerprint == s.fingerprint && s.token != "" && now.Before(s.expiresAt)
-		if s.serveStale {
+		if fingerprint == s.fingerprint && s.token != "" && now.Before(s.expiresAt) {
 			if s.logger != nil {
 				s.logger.Warn("failed to refresh GitHub App token, serving unexpired token",
 					"secret", s.name,
@@ -206,9 +207,9 @@ func (s *githubAppSource) Get(ctx context.Context) (string, error) {
 	s.fingerprint = fingerprint
 	s.token = token
 	s.expiresAt = expiresAt
+	s.failedFingerprint = [32]byte{}
 	s.lastErr = nil
 	s.retryAt = time.Time{}
-	s.serveStale = false
 	return token, nil
 }
 
