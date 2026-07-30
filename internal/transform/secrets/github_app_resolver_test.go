@@ -2,10 +2,8 @@ package secrets
 
 import (
 	"context"
-	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -21,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -56,7 +55,7 @@ func (s *githubAppTestSource) set(value string) {
 	s.value = value
 }
 
-func githubAppPrivateKey(t *testing.T) (*rsa.PrivateKey, string) {
+func githubAppPrivateKey(t *testing.T) string {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	require.NoError(t, err)
@@ -64,7 +63,7 @@ func githubAppPrivateKey(t *testing.T) (*rsa.PrivateKey, string) {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	})
-	return key, string(value)
+	return string(value)
 }
 
 func githubAppSourceNode(t *testing.T, overrides ...func(map[string]any)) yaml.Node {
@@ -117,16 +116,14 @@ type recordedGitHubTokenRequest struct {
 	path       string
 	method     string
 	authorizer string
-	apiVersion string
-	userAgent  string
 	body       struct {
 		Repositories []string          `json:"repositories"`
 		Permissions  map[string]string `json:"permissions"`
 	}
 }
 
-func TestGitHubAppSource_MintsCachesAndRefreshesInstallationToken(t *testing.T) {
-	privateKey, privateKeyPEM := githubAppPrivateKey(t)
+func TestGitHubAppSource_CachesAndRebuildsAfterCredentialRotation(t *testing.T) {
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	var mu sync.Mutex
 	var requests []recordedGitHubTokenRequest
@@ -136,8 +133,6 @@ func TestGitHubAppSource_MintsCachesAndRefreshesInstallationToken(t *testing.T) 
 		recorded.path = r.URL.Path
 		recorded.method = r.Method
 		recorded.authorizer = r.Header.Get("Authorization")
-		recorded.apiVersion = r.Header.Get("X-GitHub-Api-Version")
-		recorded.userAgent = r.Header.Get("User-Agent")
 		if err := json.NewDecoder(r.Body).Decode(&recorded.body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -151,13 +146,14 @@ func TestGitHubAppSource_MintsCachesAndRefreshesInstallationToken(t *testing.T) 
 		// The httptest response writer does not report encoding failures in this handler.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"token":      fmt.Sprintf("installation-token-%d", call),
-			"expires_at": now.Add(time.Hour),
+			"expires_at": time.Now().Add(time.Hour),
 		})
 	}))
 	t.Cleanup(server.Close)
 
+	appID := &githubAppTestSource{name: "app-id", value: "123"}
 	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
-		"APP_ID":          {name: "app-id", value: "Iv1.test-client-id"},
+		"APP_ID":          appID,
 		"INSTALLATION_ID": {name: "installation-id", value: "12345"},
 		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
 	})
@@ -175,13 +171,11 @@ func TestGitHubAppSource_MintsCachesAndRefreshesInstallationToken(t *testing.T) 
 	mu.Unlock()
 	require.Equal(t, http.MethodPost, first.method)
 	require.Equal(t, "/app/installations/12345/access_tokens", first.path)
-	require.Equal(t, githubAPIVersion, first.apiVersion)
-	require.Equal(t, "iron-proxy", first.userAgent)
+	require.True(t, strings.HasPrefix(first.authorizer, "Bearer "))
 	require.Equal(t, []string{"sol"}, first.body.Repositories)
 	require.Equal(t, map[string]string{"contents": "write", "pull_requests": "write"}, first.body.Permissions)
-	verifyGitHubAppJWT(t, strings.TrimPrefix(first.authorizer, "Bearer "), privateKey, "Iv1.test-client-id", now)
 
-	now = now.Add(56 * time.Minute)
+	appID.set("124")
 	token, err = source.Get(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "installation-token-2", token)
@@ -190,44 +184,15 @@ func TestGitHubAppSource_MintsCachesAndRefreshesInstallationToken(t *testing.T) 
 	mu.Unlock()
 }
 
-func verifyGitHubAppJWT(t *testing.T, token string, privateKey *rsa.PrivateKey, appID string, now time.Time) {
-	t.Helper()
-	parts := strings.Split(token, ".")
-	require.Len(t, parts, 3)
-
-	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-	require.NoError(t, err)
-	var header map[string]string
-	require.NoError(t, json.Unmarshal(headerBytes, &header))
-	require.Equal(t, map[string]string{"alg": "RS256", "typ": "JWT"}, header)
-
-	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-	require.NoError(t, err)
-	var claims struct {
-		IssuedAt  int64  `json:"iat"`
-		ExpiresAt int64  `json:"exp"`
-		Issuer    string `json:"iss"`
-	}
-	require.NoError(t, json.Unmarshal(claimsBytes, &claims))
-	require.Equal(t, now.Add(-time.Minute).Unix(), claims.IssuedAt)
-	require.Equal(t, now.Add(9*time.Minute).Unix(), claims.ExpiresAt)
-	require.Equal(t, appID, claims.Issuer)
-
-	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
-	require.NoError(t, err)
-	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	require.NoError(t, rsa.VerifyPKCS1v15(&privateKey.PublicKey, crypto.SHA256, digest[:], signature))
-}
-
 func TestGitHubAppSource_ConcurrentGetsShareOneMint(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusCreated)
 		// The httptest response writer does not report encoding failures in this handler.
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "shared-token", "expires_at": now.Add(time.Hour)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "shared-token", "expires_at": time.Now().Add(time.Hour)})
 	}))
 	t.Cleanup(server.Close)
 	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
@@ -259,14 +224,14 @@ func TestGitHubAppSource_ConcurrentGetsShareOneMint(t *testing.T) {
 }
 
 func TestGitHubAppSource_ReplacesBearerAndBasicProxyCredentials(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusCreated)
 		// The httptest response writer does not report encoding failures in this handler.
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "installation-token", "expires_at": now.Add(time.Hour)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": "installation-token", "expires_at": time.Now().Add(time.Hour)})
 	}))
 	t.Cleanup(server.Close)
 	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
@@ -304,7 +269,7 @@ func TestGitHubAppSource_ReplacesBearerAndBasicProxyCredentials(t *testing.T) {
 }
 
 func TestGitHubAppSource_CachesFailuresWithoutLeakingResponseBody(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -314,8 +279,9 @@ func TestGitHubAppSource_CachesFailuresWithoutLeakingResponseBody(t *testing.T) 
 		_, _ = w.Write([]byte(`{"token":"response-secret"}`))
 	}))
 	t.Cleanup(server.Close)
+	appID := &githubAppTestSource{name: "app-id", value: "123"}
 	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
-		"APP_ID":          {name: "app-id", value: "123"},
+		"APP_ID":          appID,
 		"INSTALLATION_ID": {name: "installation-id", value: "456"},
 		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
 	})
@@ -327,93 +293,91 @@ func TestGitHubAppSource_CachesFailuresWithoutLeakingResponseBody(t *testing.T) 
 	_, err = source.Get(context.Background())
 	require.Error(t, err)
 	require.Equal(t, int64(1), calls.Load())
+
+	appID.set("124")
+	_, err = source.Get(context.Background())
+	require.Error(t, err)
+	require.Equal(t, int64(2), calls.Load())
 }
 
-func TestGitHubAppSource_ServesOnlyMatchingUnexpiredTokenOnRefreshFailure(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+func TestGitHubAppSource_RetriesEmptyTokenResponseAfterFailureTTL(t *testing.T) {
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		call := calls.Add(1)
+		token := ""
 		if call > 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
+			token = "recovered-token"
 		}
 		w.WriteHeader(http.StatusCreated)
 		// The httptest response writer does not report encoding failures in this handler.
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "initial-token", "expires_at": now.Add(time.Hour)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(time.Hour)})
 	}))
 	t.Cleanup(server.Close)
-	appID := &githubAppTestSource{name: "app-id", value: "123"}
 	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
-		"APP_ID":          appID,
-		"INSTALLATION_ID": {name: "installation-id", value: "456"},
-		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
-	})
-
-	token, err := source.Get(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "initial-token", token)
-	now = now.Add(56 * time.Minute)
-	token, err = source.Get(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "initial-token", token)
-	require.Equal(t, int64(2), calls.Load())
-
-	appID.set("rotated-app-id")
-	now = now.Add(time.Second)
-	_, err = source.Get(context.Background())
-	require.Error(t, err)
-	require.Equal(t, int64(3), calls.Load())
-	_, err = source.Get(context.Background())
-	require.Error(t, err)
-	require.Equal(t, int64(3), calls.Load())
-}
-
-func TestGitHubAppSource_DoesNotServeTokenThatExpiresDuringRefresh(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
-	start := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	refreshStartedAt := start.Add(59*time.Minute + 50*time.Second)
-	refreshFailedAt := start.Add(60*time.Minute + 10*time.Second)
-	var nowUnix atomic.Int64
-	nowUnix.Store(start.Unix())
-	now := func() time.Time { return time.Unix(nowUnix.Load(), 0).UTC() }
-	var calls atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if calls.Add(1) > 1 {
-			nowUnix.Store(refreshFailedAt.Unix())
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusCreated)
-		// The httptest response writer does not report encoding failures in this handler.
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": "initial-token", "expires_at": start.Add(time.Hour)})
-	}))
-	t.Cleanup(server.Close)
-	source := buildGitHubAppTestSource(t, server, now, map[string]*githubAppTestSource{
 		"APP_ID":          {name: "app-id", value: "123"},
 		"INSTALLATION_ID": {name: "installation-id", value: "456"},
 		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
-	}, func(config map[string]any) {
-		config["failure_ttl"] = "5s"
 	})
 
+	_, err := source.Get(context.Background())
+	require.ErrorContains(t, err, "empty token")
+	now = now.Add(defaultFailureTTL)
 	token, err := source.Get(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, "initial-token", token)
-	nowUnix.Store(refreshStartedAt.Unix())
-	token, err = source.Get(context.Background())
-	require.Error(t, err)
-	require.Empty(t, token)
-	require.Equal(t, int64(2), calls.Load())
-
-	_, err = source.Get(context.Background())
-	require.Error(t, err)
+	require.Equal(t, "recovered-token", token)
 	require.Equal(t, int64(2), calls.Load())
 }
 
+type githubAppRoundTripper func(*http.Request) (*http.Response, error)
+
+func (fn githubAppRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+type trackedGitHubResponseBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *trackedGitHubResponseBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
+
+func TestGitHubAppSource_ClosesFailureResponseBody(t *testing.T) {
+	privateKeyPEM := githubAppPrivateKey(t)
+	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(server.Close)
+	source := buildGitHubAppTestSource(t, server, func() time.Time { return now }, map[string]*githubAppTestSource{
+		"APP_ID":          {name: "app-id", value: "123"},
+		"INSTALLATION_ID": {name: "installation-id", value: "456"},
+		"PRIVATE_KEY":     {name: "private-key", value: privateKeyPEM},
+	})
+	body := &trackedGitHubResponseBody{Reader: strings.NewReader(`{"token":"response-secret"}`)}
+	source.client = &http.Client{Transport: githubAppRoundTripper(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Status:     "401 Unauthorized",
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    req,
+		}, nil
+	})}
+
+	_, err := source.Get(context.Background())
+	require.Error(t, err)
+	require.True(t, body.closed.Load())
+	var httpErr *ghinstallation.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.NoBody, httpErr.Response.Body)
+	require.Empty(t, httpErr.Response.Request.Header.Get("Authorization"))
+}
+
 func TestGitHubAppBuilder_ValidatesConfiguration(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+	privateKeyPEM := githubAppPrivateKey(t)
 	server := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(server.Close)
 	sources := map[string]*githubAppTestSource{
@@ -469,6 +433,13 @@ func TestGitHubAppBuilder_ValidatesConfiguration(t *testing.T) {
 			errMsg: "at most 500 repositories",
 		},
 		{
+			name: "unknown permission",
+			override: func(config map[string]any) {
+				config["permissions"] = map[string]string{"future_permission": "read"}
+			},
+			errMsg: `unknown field "future_permission"`,
+		},
+		{
 			name: "recursive source",
 			override: func(config map[string]any) {
 				config["app_id"] = map[string]any{"type": "github_app"}
@@ -501,7 +472,7 @@ func TestDefaultRegistry_BuildsGitHubAppSource(t *testing.T) {
 }
 
 func TestGitHubAppSource_RejectsInvalidResolvedCredentials(t *testing.T) {
-	_, privateKeyPEM := githubAppPrivateKey(t)
+	privateKeyPEM := githubAppPrivateKey(t)
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
 	server := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(server.Close)
@@ -513,9 +484,9 @@ func TestGitHubAppSource_RejectsInvalidResolvedCredentials(t *testing.T) {
 		key     string
 		errMsg  string
 	}{
-		{name: "empty app ID", install: "456", key: privateKeyPEM, errMsg: "App ID"},
+		{name: "invalid app ID", appID: "Iv1.client-id", install: "456", key: privateKeyPEM, errMsg: "positive integer"},
 		{name: "invalid installation ID", appID: "123", install: "not-an-id", key: privateKeyPEM, errMsg: "positive integer"},
-		{name: "invalid private key", appID: "123", install: "456", key: "not-pem", errMsg: "not PEM encoded"},
+		{name: "invalid private key", appID: "123", install: "456", key: "not-pem", errMsg: "PEM encoded"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,13 +499,4 @@ func TestGitHubAppSource_RejectsInvalidResolvedCredentials(t *testing.T) {
 			require.ErrorContains(t, err, tc.errMsg)
 		})
 	}
-}
-
-func TestParseRSAPrivateKey_PKCS8(t *testing.T) {
-	key, _ := githubAppPrivateKey(t)
-	encoded, err := x509.MarshalPKCS8PrivateKey(key)
-	require.NoError(t, err)
-	parsed, err := parseRSAPrivateKey(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded}))
-	require.NoError(t, err)
-	require.Equal(t, key.N, parsed.N)
 }

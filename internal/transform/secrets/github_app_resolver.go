@@ -1,42 +1,30 @@
 package secrets
 
 import (
+	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/google/go-github/v88/github"
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	githubAPIBaseURL       = "https://api.github.com"
-	githubAPIVersion       = "2026-03-10"
-	githubAppRefreshBefore = 5 * time.Minute
 	githubMaxRepositories  = 500
 	githubMaxResponseBytes = 1 << 20
 )
-
-var defaultGitHubAppClient = &http.Client{
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
 
 type githubAppConfig struct {
 	Type           string            `yaml:"type"`
@@ -62,7 +50,7 @@ func newGitHubAppBuilder(logger *slog.Logger, buildSource nestedSourceBuilder) *
 	return &githubAppBuilder{
 		logger:      logger,
 		buildSource: buildSource,
-		client:      defaultGitHubAppClient,
+		client:      http.DefaultClient,
 		baseURL:     githubAPIBaseURL,
 		now:         time.Now,
 	}
@@ -83,6 +71,10 @@ func (b *githubAppBuilder) Build(raw yaml.Node) (secretSource, error) {
 	if failureTTL == 0 {
 		failureTTL = defaultFailureTTL
 	}
+	tokenOptions, err := githubInstallationTokenOptions(cfg.Repositories, cfg.Permissions)
+	if err != nil {
+		return nil, err
+	}
 
 	appID, err := b.buildCredentialSource("app_id", cfg.AppID)
 	if err != nil {
@@ -102,14 +94,44 @@ func (b *githubAppBuilder) Build(raw yaml.Node) (secretSource, error) {
 		appID:          appID,
 		installationID: installationID,
 		privateKey:     privateKey,
-		repositories:   append([]string(nil), cfg.Repositories...),
-		permissions:    cloneStringMap(cfg.Permissions),
+		tokenOptions:   tokenOptions,
 		failureTTL:     failureTTL,
 		logger:         b.logger,
 		client:         b.client,
 		baseURL:        strings.TrimRight(b.baseURL, "/"),
 		now:            b.now,
 	}, nil
+}
+
+func githubInstallationTokenOptions(
+	repositories []string,
+	permissionValues map[string]string,
+) (*github.InstallationTokenOptions, error) {
+	if len(repositories) == 0 && len(permissionValues) == 0 {
+		return nil, nil
+	}
+	options := &github.InstallationTokenOptions{
+		Repositories: append([]string(nil), repositories...),
+	}
+	if len(permissionValues) == 0 {
+		return options, nil
+	}
+
+	// ghinstallation accepts go-github's typed permissions rather than the API's
+	// string map. Reject unknown keys so a new or misspelled permission is not
+	// silently omitted by encoding/json.
+	encoded, err := json.Marshal(permissionValues)
+	if err != nil {
+		return nil, fmt.Errorf("encoding github_app permissions: %w", err)
+	}
+	var permissions github.InstallationPermissions
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&permissions); err != nil {
+		return nil, fmt.Errorf("parsing github_app permissions: %w", err)
+	}
+	options.Permissions = &permissions
+	return options, nil
 }
 
 func (b *githubAppBuilder) buildCredentialSource(field string, node yaml.Node) (secretSource, error) {
@@ -137,8 +159,7 @@ type githubAppSource struct {
 	appID          secretSource
 	installationID secretSource
 	privateKey     secretSource
-	repositories   []string
-	permissions    map[string]string
+	tokenOptions   *github.InstallationTokenOptions
 	failureTTL     time.Duration
 	logger         *slog.Logger
 	client         *http.Client
@@ -146,8 +167,7 @@ type githubAppSource struct {
 	now            func() time.Time
 
 	fingerprint [32]byte
-	token       string
-	expiresAt   time.Time
+	transport   *ghinstallation.Transport
 
 	failedFingerprint [32]byte
 	lastErr           error
@@ -169,52 +189,89 @@ func (s *githubAppSource) Get(ctx context.Context) (string, error) {
 	}
 	now := s.now()
 	if s.lastErr != nil && fingerprint == s.failedFingerprint && now.Before(s.retryAt) {
-		if fingerprint == s.fingerprint && s.token != "" && now.Before(s.expiresAt) {
-			return s.token, nil
-		}
 		return "", s.lastErr
 	}
-	if fingerprint == s.fingerprint && s.token != "" && now.Add(githubAppRefreshBefore).Before(s.expiresAt) {
-		return s.token, nil
+	if s.transport == nil || fingerprint != s.fingerprint {
+		transport, err := s.newTransport(credentials)
+		if err != nil {
+			return s.cacheFailure(fingerprint, err)
+		}
+		s.fingerprint = fingerprint
+		s.transport = transport
 	}
 
-	token, expiresAt, err := s.mint(fetchCtx, credentials, now)
+	token, err := s.transport.Token(fetchCtx)
 	if err != nil {
-		now = s.now()
-		s.failedFingerprint = fingerprint
-		s.lastErr = err
-		s.retryAt = now.Add(s.failureTTL)
-		if fingerprint == s.fingerprint && s.token != "" && now.Before(s.expiresAt) {
-			if s.logger != nil {
-				s.logger.Warn("failed to refresh GitHub App token, serving unexpired token",
-					"secret", s.name,
-					"error", err,
-					"retry_in", s.failureTTL,
-				)
-			}
-			return s.token, nil
-		}
-		if s.logger != nil {
-			s.logger.Warn("failed to mint GitHub App token, caching error",
-				"secret", s.name,
-				"error", err,
-				"retry_in", s.failureTTL,
-			)
-		}
-		return "", err
+		return s.cacheFailure(fingerprint, githubInstallationTokenError(err))
+	}
+	if token == "" {
+		// ghinstallation caches the decoded response before returning the token.
+		// Discard it so failure_ttl expiration can trigger a new request.
+		s.transport = nil
+		return s.cacheFailure(fingerprint, fmt.Errorf("GitHub App installation token response contained an empty token"))
 	}
 
-	s.fingerprint = fingerprint
-	s.token = token
-	s.expiresAt = expiresAt
 	s.failedFingerprint = [32]byte{}
 	s.lastErr = nil
 	s.retryAt = time.Time{}
 	return token, nil
 }
 
+func (s *githubAppSource) newTransport(credentials githubAppCredentials) (*ghinstallation.Transport, error) {
+	baseTransport := s.client.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	transport, err := ghinstallation.New(
+		baseTransport,
+		credentials.appID,
+		credentials.installationID,
+		[]byte(credentials.privateKey),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("configuring GitHub App authentication: %w", err)
+	}
+	transport.BaseURL = s.baseURL
+	transport.Client = s.client
+	transport.InstallationTokenOptions = s.tokenOptions
+	return transport, nil
+}
+
+func (s *githubAppSource) cacheFailure(fingerprint [32]byte, err error) (string, error) {
+	s.failedFingerprint = fingerprint
+	s.lastErr = err
+	s.retryAt = s.now().Add(s.failureTTL)
+	if s.logger != nil {
+		s.logger.Warn("failed to mint GitHub App token, caching error",
+			"secret", s.name,
+			"error", err,
+			"retry_in", s.failureTTL,
+		)
+	}
+	return "", err
+}
+
+func githubInstallationTokenError(err error) error {
+	// ghinstallation leaves non-2xx bodies open so callers can inspect them.
+	// iron-proxy does not expose GitHub response bodies, so close the body and
+	// scrub the generated JWT before this error is cached or logged.
+	// https://github.com/bradleyfalzon/ghinstallation/blob/v2.19.0/transport.go#L241-L246
+	var httpErr *ghinstallation.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Response != nil {
+		if httpErr.Response.Body != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(httpErr.Response.Body, githubMaxResponseBytes))
+			_ = httpErr.Response.Body.Close()
+			httpErr.Response.Body = http.NoBody
+		}
+		if httpErr.Response.Request != nil {
+			httpErr.Response.Request.Header.Del("Authorization")
+		}
+	}
+	return fmt.Errorf("requesting GitHub App installation token: %w", err)
+}
+
 type githubAppCredentials struct {
-	appID          string
+	appID          int64
 	installationID int64
 	privateKey     string
 }
@@ -224,9 +281,9 @@ func (s *githubAppSource) resolveCredentials(ctx context.Context) (githubAppCred
 	if err != nil {
 		return githubAppCredentials{}, [32]byte{}, fmt.Errorf("loading GitHub App ID from %q: %w", s.appID.Name(), err)
 	}
-	appID = strings.TrimSpace(appID)
-	if appID == "" {
-		return githubAppCredentials{}, [32]byte{}, fmt.Errorf("GitHub App ID from %q is empty", s.appID.Name())
+	appIDValue, err := strconv.ParseInt(strings.TrimSpace(appID), 10, 64)
+	if err != nil || appIDValue <= 0 {
+		return githubAppCredentials{}, [32]byte{}, fmt.Errorf("GitHub App ID from %q must be a positive integer", s.appID.Name())
 	}
 
 	installationIDValue, err := s.installationID.Get(ctx)
@@ -247,7 +304,7 @@ func (s *githubAppSource) resolveCredentials(ctx context.Context) (githubAppCred
 	}
 
 	credentials := githubAppCredentials{
-		appID:          appID,
+		appID:          appIDValue,
 		installationID: installationID,
 		privateKey:     privateKey,
 	}
@@ -255,148 +312,7 @@ func (s *githubAppSource) resolveCredentials(ctx context.Context) (githubAppCred
 }
 
 func (s *githubAppSource) credentialsFingerprint(credentials githubAppCredentials) [32]byte {
-	h := sha256.New()
-	writeHashField(h, credentials.appID)
-	writeHashField(h, strconv.FormatInt(credentials.installationID, 10))
-	writeHashField(h, credentials.privateKey)
-	for _, repository := range s.repositories {
-		writeHashField(h, repository)
-	}
-	permissionNames := make([]string, 0, len(s.permissions))
-	for name := range s.permissions {
-		permissionNames = append(permissionNames, name)
-	}
-	sort.Strings(permissionNames)
-	for _, name := range permissionNames {
-		writeHashField(h, name)
-		writeHashField(h, s.permissions[name])
-	}
-	var fingerprint [32]byte
-	copy(fingerprint[:], h.Sum(nil))
-	return fingerprint
-}
-
-func writeHashField(h io.Writer, value string) {
-	var size [4]byte
-	binary.BigEndian.PutUint32(size[:], uint32(len(value)))
-	// Hash writers never return write errors.
-	_, _ = h.Write(size[:])
-	_, _ = h.Write([]byte(value))
-}
-
-func (s *githubAppSource) mint(ctx context.Context, credentials githubAppCredentials, now time.Time) (string, time.Time, error) {
-	privateKey, err := parseRSAPrivateKey([]byte(credentials.privateKey))
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	jwt, err := signGitHubAppJWT(privateKey, credentials.appID, now)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-
-	payload, err := json.Marshal(struct {
-		Repositories []string          `json:"repositories,omitempty"`
-		Permissions  map[string]string `json:"permissions,omitempty"`
-	}{
-		Repositories: s.repositories,
-		Permissions:  s.permissions,
-	})
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("encoding GitHub App token request: %w", err)
-	}
-	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", s.baseURL, credentials.installationID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("creating GitHub App token request: %w", err)
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+jwt)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "iron-proxy")
-	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("requesting GitHub App installation token: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, githubMaxResponseBytes))
-		return "", time.Time{}, fmt.Errorf("GitHub App installation token endpoint returned %s", resp.Status)
-	}
-
-	var result struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, githubMaxResponseBytes)).Decode(&result); err != nil {
-		return "", time.Time{}, fmt.Errorf("decoding GitHub App installation token response: %w", err)
-	}
-	if result.Token == "" {
-		return "", time.Time{}, fmt.Errorf("GitHub App installation token response contained an empty token")
-	}
-	if !result.ExpiresAt.After(now) {
-		return "", time.Time{}, fmt.Errorf("GitHub App installation token response contained an invalid expiration")
-	}
-	return result.Token, result.ExpiresAt, nil
-}
-
-func parseRSAPrivateKey(value []byte) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode(value)
-	if block == nil {
-		return nil, fmt.Errorf("GitHub App private key is not PEM encoded")
-	}
-	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		return key, nil
-	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parsing GitHub App RSA private key: %w", err)
-	}
-	key, ok := parsed.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("GitHub App private key is not an RSA key")
-	}
-	return key, nil
-}
-
-func signGitHubAppJWT(privateKey *rsa.PrivateKey, appID string, now time.Time) (string, error) {
-	header, err := json.Marshal(struct {
-		Algorithm string `json:"alg"`
-		Type      string `json:"typ"`
-	}{Algorithm: "RS256", Type: "JWT"})
-	if err != nil {
-		return "", fmt.Errorf("encoding GitHub App JWT header: %w", err)
-	}
-	claims, err := json.Marshal(struct {
-		IssuedAt  int64  `json:"iat"`
-		ExpiresAt int64  `json:"exp"`
-		Issuer    string `json:"iss"`
-	}{
-		IssuedAt:  now.Add(-time.Minute).Unix(),
-		ExpiresAt: now.Add(9 * time.Minute).Unix(),
-		Issuer:    appID,
-	})
-	if err != nil {
-		return "", fmt.Errorf("encoding GitHub App JWT claims: %w", err)
-	}
-
-	unsigned := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
-	digest := sha256.Sum256([]byte(unsigned))
-	signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey, crypto.SHA256, digest[:])
-	if err != nil {
-		return "", fmt.Errorf("signing GitHub App JWT: %w", err)
-	}
-	return unsigned + "." + base64.RawURLEncoding.EncodeToString(signature), nil
-}
-
-func cloneStringMap(input map[string]string) map[string]string {
-	if input == nil {
-		return nil
-	}
-	result := make(map[string]string, len(input))
-	for key, value := range input {
-		result[key] = value
-	}
-	return result
+	value := strconv.FormatInt(credentials.appID, 10) + "\x00" +
+		strconv.FormatInt(credentials.installationID, 10) + "\x00" + credentials.privateKey
+	return sha256.Sum256([]byte(value))
 }

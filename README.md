@@ -460,11 +460,11 @@ Secret sources:
   is read from `OP_CONNECT_HOST` and the API token from `OP_CONNECT_TOKEN`.
   Optional `ttl` and `failure_ttl` are supported.
 - **`github_app`:** signs a GitHub App JWT and exchanges it for an installation
-  access token. `app_id`, `installation_id`, and `private_key` are themselves
-  secret source blocks, so each value can come from any other supported source.
-  Optional `repositories` and `permissions` restrict the installation token.
-  Tokens are cached until five minutes before GitHub's expiration and refreshed
-  with single-flight behavior. `failure_ttl` defaults to 1m.
+  access token. `app_id` must resolve to the positive integer App ID;
+  `app_id`, `installation_id`, and `private_key` are themselves secret source
+  blocks, so each value can come from any other supported source. Optional
+  `repositories` and `permissions` restrict the installation token. Tokens are
+  cached and refreshed shortly before expiration. `failure_ttl` defaults to 1m.
 
 Every source also accepts an optional `json_key`. When set, the resolved value
 is parsed as a JSON object and the single top-level string field at that key is
